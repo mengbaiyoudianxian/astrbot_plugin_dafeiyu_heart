@@ -39,6 +39,8 @@ https://github.com/mengbaiyoudianxian/astrbot_plugin_dafeiyu_heart
 | `morning_hours` | 起床气时段 |  |
 | `night_hours` | 深夜感性时段 |  |
 | `owner_umo` | 主人会话 ID | 留空用 B 站插件的 OWNER_QQ_UMO |
+| `review_every` | 每跟一个人聊多少条，她自己复盘一次对他的看法 |  |
+| `review_provider_id` | 复盘用哪个模型 | 留空用主力聊天模型（她本人） |
 
 ## 许可
 

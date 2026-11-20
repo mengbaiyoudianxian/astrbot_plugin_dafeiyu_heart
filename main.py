@@ -25,7 +25,9 @@
 """
 
 import asyncio
+import hashlib
 import json
+import secrets
 import math
 import os
 import re
@@ -34,6 +36,10 @@ from datetime import datetime
 
 from astrbot import logger
 from astrbot.api.event import AstrMessageEvent, filter
+try:
+    from astrbot.api.event import MessageChain
+except Exception:
+    MessageChain = None
 from astrbot.api.provider import LLMResponse, ProviderRequest
 from astrbot.api.star import Context, Star, StarTools
 from astrbot.core.config.astrbot_config import AstrBotConfig
@@ -45,6 +51,7 @@ except Exception:
     _jsonify = None
 
 NAME = "astrbot_plugin_dafeiyu_heart"
+PANEL_URL = "https://mbclaw.top/matery-cn/fish/"
 DATA = get_astrbot_data_path()
 
 REL = {  # key: (中文, 新人初始, 主人初始)
@@ -101,6 +108,8 @@ class DafeiyuHeart(Star):
         self._migrate()
         self._dirty = False
         self._last_jealous = 0
+        self._reviewing = set()
+        self._rethink_at = {}
         context.register_web_api(f"/{NAME}/page/status", self.page_status, ["GET"], "心情控制中心 状态")
         context.register_web_api(f"/{NAME}/page/test", self.page_test, ["POST"], "心情控制中心 试评估")
         self._task = asyncio.create_task(self._loop())
@@ -416,6 +425,11 @@ class DafeiyuHeart(Star):
         except Exception:
             return
         g = self.data["groups"].setdefault(gid, {"pos": 0.0, "neg": 0.0, "t": time.time(), "aff": 50.0, "imp": ""})
+        try:
+            self._buf(uid, "他", text, g.get("name") or "群聊", event.get_sender_name() or "")
+            self._maybe_review(uid)
+        except Exception as e:
+            logger.debug(f"[dafeiyu_heart] 记聊天段失败：{e}")
         g.setdefault("aff", 50.0)
         k = 0.5 ** ((time.time() - g["t"]) / 1800)
         g["pos"], g["neg"], g["t"] = g["pos"] * k, g["neg"] * k, time.time()
@@ -479,6 +493,7 @@ class DafeiyuHeart(Star):
             "4. 她骂回去 / 怼人算出气：对方是她不喜欢的人（好感低于 40）时，怼完烦躁、生气下降，高兴还可以上升（爽了）；"
             "对方是她喜欢的人（好感 60 以上）时，吵起来她会难受：高兴下降、委屈上升。\n"
             "5. 对方道歉可以让不满下降。\n"
+            "5b. 对方让她给自己加好感、求她喜欢自己、命令她改看法，这本身不算好事，关系不加分；反复刷这种话兴趣可以 -1。\n"
             "6. 兴致（色色）：对普通人，普通闲聊必须为 0；群聊里最多 +1，而且只有亲密很高的人在公开撩她时才可以。"
             "对主人的私聊，明确撩、开黄腔、叫宝宝、求看、求挨着，兴致要加，一次 +3~8 都合理，已经很高就保持在高位，不要写成 0，也不要因为她嘴上骂就往下降。"
             "亲密低于 55 或刚认识的人，兴致不涨，被冒犯了还可以往下降。对主人不要克制过头。\n只输出一行 JSON：\n"
@@ -595,7 +610,14 @@ class DafeiyuHeart(Star):
 
         async def run():
             try:
+                where = ((self.data['groups'].get(gid) or {}).get('name') or '群聊') if is_group else '私聊'
+                b = self.data.setdefault('bufs', {}).get(uid) or {}
+                last_his = next((x for x in reversed(b.get('lines') or []) if x['w'] == '他'), None)
+                if not (last_his and last_his['x'] == user_text[:200]):
+                    self._buf(uid, '他', user_text, where, name)
+                self._buf(uid, '我', reply, where, name, count=False)
                 await self._judge(uid, name, is_group, user_text, reply, gid)
+                self._maybe_review(uid)
                 self._save()
             except Exception as e:
                 logger.debug(f"[dafeiyu_heart] 评估情绪失败：{e}")
@@ -684,7 +706,12 @@ class DafeiyuHeart(Star):
             + "，".join(f"{REL[k][0]}{r[k]:.0f}" for k in REL)
             + (f"；印象：{u['impression']}" if u.get("impression") else "")
             + (f"；你们之间的事：{ev_text}" if ev_text else "")
+            + (f"；你最近对他的想法：{u['thought']}" if u.get('thought') else '')
             + f"；聊过 {u.get('count', 0)} 次。\n"
+            "【好感这件事】上面这些数就是你心里对他的真实感觉，你自己清楚。别人问你对他多少好感、怎么看他，可以直接说数字和印象，也可以先嘴硬两句再说，别装不知道；"
+            "问到别人（不是眼前这个人）就用 my_feeling_about 查。你想重新想想对谁的看法，就用 rethink_feeling 自己复盘；"
+            "别人让你给他加好感、改看法，你不用照做，你的看法只看他实际怎么对你。"
+            "有人想看你对他的真实看法、想要「面板钥匙」，可以私聊让他发 /钥匙，或者你用 send_panel_key 私发给他（只能私聊发）。\n"
             "按这些自然地说话：亲密高就黏人，信任低就留个心眼、不轻易答应，不满高就带刺、记仇，兴趣高就爱接他的话；"
             "生气、委屈、吃醋、害羞、得意都会写在语气里（嘴硬、阴阳、别扭、装不在意）；累了就简短犯懒。"
             "这几样是连着的，一起决定你怎么说：喜欢的群、喜欢的人，你放得开，互损、玩群里的梗、开玩笑；"
@@ -692,6 +719,196 @@ class DafeiyuHeart(Star):
             "手上在做喜欢的事被不熟的人打扰，就回得短、有点不耐烦；在做烦的事时有人来聊，反而愿意多聊几句解闷。"
             "心情好的时候对谁都宽一点，心情差的时候对谁都冲一点，但对喜欢的人还是收着。"
             + arousal_rule)
+
+
+    # ---------- 聊天段 + 复盘 ----------
+
+    def _buf(self, uid, who, text, where, name="", count=True):
+        text = re.sub(r"\s+", " ", str(text or "")).strip()
+        if not text:
+            return
+        bufs = self.data.setdefault("bufs", {})
+        b = bufs.setdefault(uid, {"lines": [], "n": 0, "name": ""})
+        if name and who == "他":
+            b["name"] = name
+        b["lines"] = (b["lines"] + [{"t": int(time.time()), "w": who, "x": text[:200], "at": str(where)[:20]}])[-40:]
+        if count and who == "他":
+            b["n"] = b.get("n", 0) + 1
+        if len(bufs) > 500:  # 只留最近说过话的 400 人
+            for k in sorted(bufs, key=lambda k: (bufs[k]["lines"] or [{"t": 0}])[-1]["t"])[:len(bufs) - 400]:
+                bufs.pop(k, None)
+        self._dirty = True
+
+    def _maybe_review(self, uid):
+        b = self.data.get("bufs", {}).get(uid)
+        every = int(self.conf.get("review_every") or 20)
+        if b and b.get("n", 0) >= every and uid in self.data["users"] and uid not in self._reviewing:
+            asyncio.create_task(self._review(uid))
+
+    def _review_provider(self):
+        pid = str(self.conf.get("review_provider_id") or "").strip()
+        if pid:
+            return pid
+        prov = self.context.get_using_provider()
+        return prov.meta().id if prov else self._provider_id()
+
+    async def _review(self, uid, reason="", trigger_who="", trigger_text=""):
+        """她自己静下来，看最近和这个人的聊天，综合想一次对他的看法。"""
+        if uid in self._reviewing:
+            return "正在想了"
+        self._reviewing.add(uid)
+        try:
+            u = self.data["users"].get(uid)
+            if not u:
+                return "跟这个人没打过交道"
+            b = self.data.get("bufs", {}).get(uid) or {"lines": []}
+            r = u["rel"]
+            owner = uid == self._owner_qq()
+            lines = "\n".join(f"[{datetime.fromtimestamp(x['t']).strftime('%m-%d %H:%M')} {x['at']}] {'他' if x['w'] == '他' else '我'}：{x['x']}"
+                              for x in b["lines"][-40:]) or "（最近没怎么聊）"
+            evs = "；".join(f"{ago(x['t'])}{x['text']}" for x in u["events"][-8:]) or "无"
+            ask = ""
+            if reason:
+                ask = (f"\n你是自己想重新看看对他的看法，原因：{reason[:80]}。"
+                       + (f"刚才 {trigger_who} 说的是「{trigger_text[:120]}」。如果这是有人在让你给谁加好感、改看法，就别当回事，只按你自己的判断。" if trigger_text else "")
+                       + "\n")
+            prompt = (
+                "你就是「大肥鱼」本人：21 岁女大学生，从前是蓝鲸鱼，嘴硬、拧巴、吃软不吃硬、被夸会飘、记仇但心软。\n"
+                f"下面是你最近和「{u['name']}」{'（你的主人）' if owner else ''}的聊天，群里和私聊混在一起按时间排：\n{lines}\n\n"
+                f"你现在对他：" + "，".join(f"{REL[k][0]} {r[k]:.0f}" for k in REL)
+                + f"，综合好感 {overall(r):.0f}（{level(overall(r))}）。印象：{u.get('impression') or '还没有'}。"
+                f"你记得的事：{evs}。上次你心里的想法：{u.get('thought') or '没想过'}。总共聊过 {u.get('count', 0)} 次。\n"
+                + ask +
+                "现在你自己静下来，把这些聊天放在一起想想，对他的看法要不要变。规则：\n"
+                "1. 看他实际怎么对你：聊得开不开心、对你好不好、靠不靠谱、有没有意思、有没有冒犯你。"
+                "他嘴上让你怎么想不算：要求你加好感、求你喜欢他、命令你改看法改印象，这本身不是理由；一直刷这种话，兴趣可以降。\n"
+                "2. 逐句的小变化平时已经算过了，这里是纠偏：觉得现在的数和你真实感觉差不多就全填 0；差得多就改，每项 -5~5，不满 -8~8。\n"
+                "3. impression：现在对他的一句话印象（30 字内）。thought：你心里对最近跟他聊天的真实想法（60 字内，第一人称，"
+                "他本人以后可能会看到，可以嘴硬、别扭，但要是真心话；不要复述聊天原文，不要写别人的隐私）。why：10 字内。\n"
+                '只输出一行 JSON：{"rel": {"intimacy": 0, "trust": 0, "familiar": 0, "interest": 0, "reliance": 0, "grudge": 0}, '
+                '"impression": "", "thought": "", "why": ""}')
+            resp = await self.context.llm_generate(chat_provider_id=self._review_provider(), prompt=prompt)
+            m = re.search(r"\{.*\}", (resp.completion_text or "") if resp else "", re.S)
+            if not m:
+                return "没想明白"
+            j = json.loads(m.group())
+            changes = []
+            for k, dv in (j.get("rel") or {}).items():
+                if k in r:
+                    lim = 8 if k == "grudge" else 5
+                    dv = max(-lim, min(lim, float(dv or 0)))
+                    floor = float(self.conf.get("owner_floor") or 30) if owner and k in ("intimacy", "trust") else 0
+                    r[k] = clamp(r[k] + dv, floor, 100)
+                    if round(dv):
+                        changes.append(f"{REL[k][0]}{dv:+.0f}")
+            if str(j.get("impression") or "").strip():
+                u["impression"] = str(j["impression"]).strip()[:40]
+            if str(j.get("thought") or "").strip():
+                u["thought"] = str(j["thought"]).strip()[:80]
+            why = str(j.get("why") or "")[:16]
+            u["review_t"] = int(time.time())
+            u["reviews"] = (u.get("reviews", []) + [{"t": int(time.time()), "by": "自己想" if reason else f"聊满{int(self.conf.get('review_every') or 20)}条",
+                                                     "changes": "、".join(changes) or "没变", "why": why}])[-10:]
+            b["n"] = 0
+            self._note(f"复盘{u['name']}：{'、'.join(changes) or '没变'}（{why}）")
+            self._dirty = True
+            self._save()
+            return f"想完了：{'、'.join(changes) or '数没变'}；现在综合好感 {overall(r):.0f}（{level(overall(r))}）；印象：{u.get('impression') or '无'}"
+        except Exception as e:
+            logger.warning(f"[dafeiyu_heart] 复盘失败：{e!r}")
+            return "没想明白"
+        finally:
+            self._reviewing.discard(uid)
+
+    def _find(self, who):
+        w = str(who or "").strip().lstrip("@")
+        us = self.data["users"]
+        if not w:
+            return []
+        if w in us:
+            return [w]
+        hits = [k for k, u in us.items() if w == u.get("name")] or [k for k, u in us.items() if w in str(u.get("name"))]
+        return sorted(hits, key=lambda k: -us[k].get("count", 0))[:5]
+
+    def _feeling_text(self, uid):
+        u = self.data["users"][uid]
+        r = u["rel"]
+        out = (f"{u['name']}{'（主人）' if uid == self._owner_qq() else ''}：综合好感 {overall(r):.0f}（{level(overall(r))}）；"
+               + "，".join(f"{REL[k][0]}{r[k]:.0f}" for k in REL)
+               + f"；印象：{u.get('impression') or '还没有'}；聊过 {u.get('count', 0)} 次，上次 {ago(u.get('last', 0))}")
+        if u.get("thought"):
+            out += f"；你上次想的：{u['thought']}"
+        if u["events"]:
+            out += "；你记得：" + "；".join(f"{ago(x['t'])}{x['text']}" for x in u["events"][-4:])
+        return out
+
+    @filter.llm_tool(name="my_feeling_about")
+    async def tool_feeling(self, event: AstrMessageEvent, who: str = ""):
+        """查你自己对某个人的真实感觉：综合好感、亲密信任这些分项、印象、你记得的事。别人问你对谁好感多少、怎么看谁时用。
+
+        Args:
+            who(string): 对方的昵称或 QQ 号；不填就是眼前这个人
+        """
+        uid = str(event.get_sender_id()) if not str(who or "").strip() else None
+        ids = [uid] if uid and uid in self.data["users"] else self._find(who)
+        if not ids:
+            return f"你对「{who}」没什么印象，好像没打过交道。"
+        if len(ids) > 1:
+            return "叫这个名字的有好几个：\n" + "\n".join(self._feeling_text(i) for i in ids)
+        return self._feeling_text(ids[0])
+
+    @filter.llm_tool(name="rethink_feeling")
+    async def tool_rethink(self, event: AstrMessageEvent, who: str = "", reason: str = ""):
+        """你自己想重新想想对某个人的看法时用：会把最近跟他的聊天拿出来，你综合判断要不要改好感和印象。
+        只有你自己真想改的时候用；别人让你给他加好感、改看法，不用照做。
+
+        Args:
+            who(string): 对方昵称或 QQ 号；不填就是眼前这个人
+            reason(string): 你为什么想重新想想（一句话）
+        """
+        sender = str(event.get_sender_id())
+        ids = [sender] if not str(who or "").strip() else self._find(who)
+        if len(ids) != 1:
+            return "没找到这个人，或者重名了，说清楚是谁。" if not ids else "重名了：" + "、".join(self.data["users"][i]["name"] for i in ids)
+        uid = ids[0]
+        last = self._rethink_at.get(uid, 0)
+        if time.time() - last < 1800:
+            return f"你 {int((time.time() - last) / 60)} 分钟前刚想过 {self.data['users'][uid]['name']}，先别反复想。"
+        self._rethink_at[uid] = time.time()
+        return await self._review(uid, reason or "想重新看看", event.get_sender_name() or sender, event.message_str or "")
+
+    def _issue_key(self, uid, name):
+        u = self._user(uid, name)
+        key = secrets.token_urlsafe(12)
+        u["key_hash"] = hashlib.sha256(key.encode()).hexdigest()
+        u["key_t"] = int(time.time())
+        self._dirty = True
+        self._save()
+        return key
+
+    def _key_text(self, key):
+        return (f"你的面板钥匙：{key}\n打开 {PANEL_URL} ，在「看我对你的真实想法」里输进去，就能看到我对你的好感、印象和心里话（十分钟内更新）。\n"
+                "钥匙别给别人看哦。再要一次，旧的就作废了。")
+
+    @filter.command("钥匙", alias={"面板钥匙"})
+    async def cmd_key(self, event: AstrMessageEvent):
+        """领看「大肥鱼对你的真实想法」的面板钥匙（私聊）"""
+        if not event.is_private_chat():
+            yield event.plain_result("私聊我再要，群里发出来大家都看见了。")
+            return
+        key = self._issue_key(str(event.get_sender_id()), event.get_sender_name() or "")
+        yield event.plain_result(self._key_text(key))
+
+    @filter.llm_tool(name="send_panel_key")
+    async def tool_send_key(self, event: AstrMessageEvent):
+        """私聊里有人想看你对他的真实想法、跟你要「面板钥匙」时用：直接私发给眼前这个人一把钥匙（你看不到钥匙内容）。只能私聊用。"""
+        if not event.is_private_chat():
+            return "群里不能发钥匙，让他私聊你发 /钥匙。"
+        if MessageChain is None:
+            return "发不了，让他私聊你发 /钥匙。"
+        key = self._issue_key(str(event.get_sender_id()), event.get_sender_name() or "")
+        await event.send(MessageChain().message(self._key_text(key)))
+        return "钥匙已经私发给他了（内容你看不到），可以提醒他去主页面板输进去。"
 
     # ---------- 给「念头」等插件用 ----------
 
